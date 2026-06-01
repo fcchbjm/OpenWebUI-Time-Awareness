@@ -1,0 +1,334 @@
+"""
+title: 时间感知 Filter
+description: |
+  为 Open WebUI 中的任意大模型注入当前日期与时间上下文，零配置、即装即用。
+  1. 在每条用户消息发送给模型前，自动 prepend 当前系统时间与星期，让小模型也能准确回答「今天几号」「星期几」。
+  2. 支持 IANA 时区配置（如 Asia/Shanghai），兼容 Open WebUI 消息时间戳（毫秒/秒）。
+  3. 默认仅注入最新一条用户消息，Token 开销极低（约 15~20 token/轮）。
+  4. 支持 ISO8601 标准时间格式与自定义注入模板，满足不同模型偏好。
+  5. 内置防重复注入，多轮对话不会叠加污染历史消息。
+  6. 支持纯图片/图文混合消息：在无 text 块时自动插入时间文本，不破坏图片结构。
+  7. 不依赖 Function Calling、不调用外部 API，Ollama 本地小模型（如 qwen3:0.6b）开箱可用。
+author: fcchbjm
+version: 1.1.0
+required_open_webui_version: >= 0.5.0
+"""
+
+# ==================== 导入必要的库 ====================
+from __future__ import annotations
+
+import datetime
+from typing import Awaitable, Callable, Optional
+
+import pytz
+from pydantic import BaseModel, Field
+
+# ==================== 常量定义 ====================
+_WEEKDAY_EN = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+_WEEKDAY_ZH = (
+    "星期一",
+    "星期二",
+    "星期三",
+    "星期四",
+    "星期五",
+    "星期六",
+    "星期日",
+)
+
+# 用于识别已注入消息的前缀（含中英文及常见自定义模板）
+_INJECTION_MARKER = "[时间上下文]"
+
+_DEDUPE_PREFIXES = (
+    _INJECTION_MARKER,
+    "Current system time:",
+    "当前系统时间：",
+    "当前系统时间:",
+    "<system_time>",
+)
+
+# Open WebUI / OpenAI 多模态消息中的非文本块类型
+_MEDIA_PART_TYPES = frozenset({"image_url", "image", "input_image", "file"})
+
+
+# ==================== 主类定义 ====================
+class Filter:
+    """
+    Open WebUI Filter：在 inlet 阶段向用户消息注入时间上下文。
+
+    工作方式：
+        用户提问 → inlet() 注入时间 → 模型收到带时间的完整上下文 → 准确回答时间问题
+    """
+
+    class Valves(BaseModel):
+        enabled: bool = Field(
+            default=True,
+            description="【总开关】启用/禁用本插件",
+        )
+        timezone: str = Field(
+            default="Asia/Shanghai",
+            description=(
+                "【时区】IANA 时区名称，例如 Asia/Shanghai、UTC、America/New_York"
+            ),
+        )
+        include_weekday: bool = Field(
+            default=True,
+            description="【星期】是否在注入内容中包含星期信息",
+        )
+        weekday_language: str = Field(
+            default="zh",
+            description="【星期语言】zh=中文（星期一），en=英文（Monday）",
+            json_schema_extra={"enum": ["zh", "en"]},
+        )
+        use_iso8601: bool = Field(
+            default=False,
+            description="【ISO8601】使用标准格式（2026-06-01T15:30:21+08:00）替代普通格式",
+        )
+        inject_last_message_only: bool = Field(
+            default=True,
+            description="【推荐开启】仅向最新一条用户消息注入时间，节省 Token",
+        )
+        template: str = Field(
+            default="当前系统时间：{time}（{timezone}）",
+            description=(
+                "【注入模板】可用占位符：{time} {datetime} {iso_time} {timezone} {weekday}"
+            ),
+        )
+        show_injection_status: bool = Field(
+            default=True,
+            description="【状态提示】注入后在聊天状态栏显示当前注入的时间",
+        )
+        priority: int = Field(
+            default=0,
+            description="【执行优先级】数值越小越先执行（与其他 Filter 联用时有效）",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.type = "filter"
+        self.name = "时间感知 Filter"
+        self.description = "为模型注入当前日期与时间，让小模型也能感知「现在几点」"
+
+    # ==================== 核心入口 ====================
+    async def inlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[dict], Awaitable[None]] = None,
+        __user__: Optional[dict] = None,
+    ) -> dict:
+        if not self.valves.enabled:
+            return body
+
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+
+        tz, tz_name = self._resolve_timezone(self.valves.timezone)
+        targets = self._select_user_messages(messages)
+        last_injection = None
+
+        for message in targets:
+            injection = self._inject_time(message, tz, tz_name)
+            if injection:
+                last_injection = injection
+
+        if (
+            last_injection
+            and self.valves.show_injection_status
+            and __event_emitter__ is not None
+        ):
+            await self._emit_status(__event_emitter__, last_injection)
+
+        body["messages"] = messages
+        return body
+
+    # ==================== 时间注入逻辑 ====================
+    def _inject_time(
+        self,
+        message: dict,
+        tz: datetime.tzinfo,
+        tz_name: str,
+    ) -> Optional[str]:
+        content = message.get("content")
+
+        if isinstance(content, str):
+            return self._inject_into_string(message, content, tz, tz_name)
+
+        if isinstance(content, list):
+            return self._inject_into_list(message, content, tz, tz_name)
+
+        return None
+
+    def _inject_into_string(
+        self,
+        message: dict,
+        content: str,
+        tz: datetime.tzinfo,
+        tz_name: str,
+    ) -> Optional[str]:
+        if self._already_injected(content):
+            return None
+
+        dt = self._resolve_message_datetime(message, tz)
+        injection = self._build_injection(dt, tz_name)
+
+        if content.startswith(injection):
+            return None
+
+        message["content"] = f"{injection}\n{content}"
+        return injection
+
+    def _inject_into_list(
+        self,
+        message: dict,
+        content: list,
+        tz: datetime.tzinfo,
+        tz_name: str,
+    ) -> Optional[str]:
+        text_index = self._find_text_part_index(content)
+
+        if text_index is not None:
+            text_value = content[text_index].get("text", "")
+            if not isinstance(text_value, str):
+                text_value = ""
+
+            if self._already_injected(text_value):
+                return None
+
+            dt = self._resolve_message_datetime(message, tz)
+            injection = self._build_injection(dt, tz_name)
+
+            if text_value.startswith(injection):
+                return None
+
+            new_text = f"{injection}\n{text_value}" if text_value else injection
+            content[text_index]["text"] = new_text
+            return injection
+
+        if not self._has_media_parts(content):
+            return None
+
+        if content and self._is_text_part(content[0]):
+            first_text = content[0].get("text", "")
+            if isinstance(first_text, str) and self._already_injected(first_text):
+                return None
+
+        dt = self._resolve_message_datetime(message, tz)
+        injection = self._build_injection(dt, tz_name)
+        content.insert(0, {"type": "text", "text": injection})
+        return injection
+
+    def _build_injection(self, dt: datetime.datetime, tz_name: str) -> str:
+        formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+        iso_time = dt.isoformat(timespec="seconds")
+        weekday = self._format_weekday(dt)
+
+        time_value = iso_time if self.valves.use_iso8601 else formatted_time
+
+        context = {
+            "time": time_value,
+            "datetime": formatted_time,
+            "iso_time": iso_time,
+            "timezone": tz_name,
+            "weekday": weekday,
+        }
+
+        try:
+            injection = self.valves.template.format(**context)
+        except (KeyError, ValueError, IndexError):
+            injection = f"当前系统时间：{time_value}（{tz_name}）"
+
+        if self.valves.include_weekday and "{weekday}" not in self.valves.template:
+            label = "星期" if self.valves.weekday_language == "zh" else "Weekday"
+            injection = f"{injection}\n{label}：{weekday}"
+
+        return f"{_INJECTION_MARKER}\n{injection.strip()}"
+
+    def _format_weekday(self, dt: datetime.datetime) -> str:
+        index = dt.weekday()
+        if self.valves.weekday_language == "zh":
+            return _WEEKDAY_ZH[index]
+        return _WEEKDAY_EN[index]
+
+    def _resolve_message_datetime(
+        self,
+        message: dict,
+        tz: datetime.tzinfo,
+    ) -> datetime.datetime:
+        timestamp = message.get("timestamp") or message.get("created_at")
+
+        if timestamp is not None:
+            try:
+                ts = float(timestamp)
+                if ts > 1e11:
+                    ts = ts / 1000.0
+                return datetime.datetime.fromtimestamp(ts, tz)
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+
+        return datetime.datetime.now(tz)
+
+    def _resolve_timezone(self, tz_str: str) -> tuple[datetime.tzinfo, str]:
+        try:
+            tz = pytz.timezone(tz_str)
+            return tz, tz_str
+        except Exception:
+            return pytz.UTC, "UTC"
+
+    def _select_user_messages(self, messages: list[dict]) -> list[dict]:
+        if self.valves.inject_last_message_only:
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    return [message]
+            return []
+
+        return [message for message in messages if message.get("role") == "user"]
+
+    def _already_injected(self, content: str) -> bool:
+        stripped = content.lstrip()
+        return any(stripped.startswith(prefix) for prefix in _DEDUPE_PREFIXES)
+
+    # ==================== 消息内容读写 ====================
+    def _is_text_part(self, item: object) -> bool:
+        return isinstance(item, dict) and item.get("type") == "text"
+
+    def _is_media_part(self, item: object) -> bool:
+        return isinstance(item, dict) and item.get("type") in _MEDIA_PART_TYPES
+
+    def _find_text_part_index(self, content: list) -> Optional[int]:
+        for index, item in enumerate(content):
+            if self._is_text_part(item):
+                return index
+        return None
+
+    def _has_media_parts(self, content: list) -> bool:
+        return any(self._is_media_part(item) for item in content)
+
+    # ==================== UI 状态反馈 ====================
+    async def _emit_status(
+        self,
+        event_emitter: Callable[[dict], Awaitable[None]],
+        injection: str,
+    ) -> None:
+        preview = injection.replace(f"{_INJECTION_MARKER}\n", "", 1)
+        preview = preview.replace("\n", " | ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"🕐 时间感知：{preview}",
+                    "done": True,
+                },
+            }
+        )
